@@ -1,2 +1,4 @@
 python-telegram-bot[job-queue]
 feedparser
+anthropic
+requests
