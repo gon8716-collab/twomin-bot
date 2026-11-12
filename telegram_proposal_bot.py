@@ -132,7 +132,7 @@ async def job_monitor_loop(application):
         await asyncio.sleep(300)
 
 # -------------------------------------------------------------------------
-# 4. 텔레그램 명령어 및 버튼 핸들러
+# 4. 텔레그램 명령어 및 버튼 핸들러 (Chat ID 안내 기능 포함)
 # -------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name
@@ -141,9 +141,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"사용자 Chat ID: {chat_id}")
     
     await update.message.reply_text(
-        f"안녕하세요, {user_name}님! 2분봇이 정상적으로 작동을 시작했습니다. 🚀\n"
-        f"현재 사장님의 텔레그램 Chat ID는 `{chat_id}` 입니다.\n"
-        "이 값을 Render 환경 변수(`TELEGRAM_ADMIN_CHAT_ID`)에 등록해 주세요!"
+        f"안녕하세요, {user_name}님! 🚀\n\n"
+        f"현재 사장님의 텔레그램 Chat ID는 바로 이 번호입니다:\n"
+        f"👉 `{chat_id}` 👈\n\n"
+        "이 번호를 복사해서 Render 환경 변수(`TELEGRAM_ADMIN_CHAT_ID`)에 꼭 등록해 주세요!"
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
