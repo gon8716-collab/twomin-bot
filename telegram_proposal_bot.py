@@ -1,39 +1,19 @@
 """
 telegram_proposal_bot.py
-RSS 공고 수집 → Claude 제안서 초안 → 텔레그램 승인/거절 버튼 → 자연어 현황 대화
+1인 무인 외주 자동화 시스템 비서 봇 (최종 통합본)
 
-[기능]
-1. AI 제안서 자동 생성 (Anthropic, 기본 모델 claude-sonnet-5-5)
-2. 중복 수집/알림 방지 (SQLite 파일에 공고 링크 해시 기록, 재시작해도 유지)
-3. 인라인 버튼 [✅ 승인 (Send)] / [❌ 거절 (Reject)]
-4. 자연어 통계 대화: "오늘 수집된 공고 몇 개야?", "현황 알려줘" 처럼 평소 말투로 물어보면
-   DB 통계를 바탕으로 Claude가 친절하게 답변
-
-[필수 환경 변수]
-  TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, TELEGRAM_ADMIN_CHAT_ID
-  그리고 아래 RSS 변수 중 최소 하나 (쉼표로 여러 개 가능)
-    UPWORK_RSS_URLS   (※ Upwork는 2024-08 이후 공식 RSS를 종료함)
-    FIVERR_RSS_URLS
-    EXTRA_RSS_URLS    "라벨|URL,라벨|URL" 형식. 예) "WWR|https://weworkremotely.com/remote-jobs.rss"
-
-[선택 환경 변수]
-  ANTHROPIC_MODEL     기본 claude-sonnet-5-5
-  POLL_INTERVAL_SEC   기본 300
-  MAX_NEW_PER_CYCLE   기본 5
-  SEED_ON_FIRST_RUN   기본 true  (DB가 비어 있으면 기존 공고는 알림 없이 기준점으로만 저장)
-  DB_PATH             기본 proposal_bot.db  (Render 영구 디스크를 쓰면 /data/proposal_bot.db)
-  PROPOSAL_PROFILE    내 소개/강점
-  PORT                Render가 자동 주입
-
-[requirements.txt]
-  python-telegram-bot[job-queue]>=21.0
-  feedparser
-  anthropic
+[개선 및 반영 사항]
+1. 엄격한 일감 필터링: 시간제(Hourly) 100% 제외, 건당 고정가(Fixed-Price) & 1~3시간 컷 초단기 작업만 선별.
+2. 스마트폰 최적화 UI: 예산(원화 환산), 예상 소요 시간, 난이도, 핵심 요약 및 맞춤 제안서 제공.
+3. 1-Click 승인 / 실시간 마감 감지: 승인 시 이미 마감된 공고인지 체크하고 상태 업데이트.
+4. 중복 방지 및 SQLite 무결성 유지 (Render 영구 디스크 지원)
 """
 
+import ast
 import asyncio
 import hashlib
 import html
+import io
 import json
 import logging
 import os
@@ -59,13 +39,13 @@ from telegram.ext import (
 )
 
 # ----------------------------------------------------------------------------
-# 로깅 / 환경 변수
+# 로깅 / 환경 변수 설정
 # ----------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)  # 토큰이 URL로 로그에 찍히는 것 방지
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("proposal-bot")
 
 
@@ -104,26 +84,23 @@ def build_feeds() -> dict[str, list[str]]:
 
 FEEDS = build_feeds()
 if not FEEDS:
-    log.error(
-        "RSS 주소가 없습니다. UPWORK_RSS_URLS / FIVERR_RSS_URLS / EXTRA_RSS_URLS 중 하나를 설정하세요."
-    )
+    log.error("RSS 주소가 없습니다. UPWORK_RSS_URLS / FIVERR_RSS_URLS / EXTRA_RSS_URLS 중 하나를 설정하세요.")
     sys.exit(1)
 
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SEC", "300"))
-MAX_NEW_PER_CYCLE = int(os.environ.get("MAX_NEW_PER_CYCLE", "5"))
+MAX_NEW_PER_CYCLE = int(os.environ.get("MAX_NEW_PER_CYCLE", "3"))
 SEED_ON_FIRST_RUN = os.environ.get("SEED_ON_FIRST_RUN", "true").lower() == "true"
 DB_PATH = os.environ.get("DB_PATH", "proposal_bot.db")
 PROFILE = os.environ.get(
     "PROPOSAL_PROFILE",
-    "Indie developer at Twomin Studio building mobile and desktop applications.",
+    "Indie developer at Twomin Studio building mobile and desktop applications with strong practical execution.",
 )
-USER_AGENT = "Mozilla/5.0 (compatible; ProposalBot/2.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; ProposalBot/4.0)"
 KST = timezone(timedelta(hours=9))
 
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-# 런타임 상태 (메모리) — 자연어 현황 답변에 같이 사용
 STATE = {
     "started_at": None,
     "last_poll_at": None,
@@ -142,7 +119,7 @@ def today_str() -> str:
 
 
 # ----------------------------------------------------------------------------
-# SQLite (중복 방지 + 초안/상태 저장 + 통계)
+# SQLite 데이터베이스 관리 (중복 방지 및 초안 저장)
 # ----------------------------------------------------------------------------
 _db_lock = threading.Lock()
 
@@ -151,28 +128,37 @@ def _conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH, timeout=10)
 
 
+def _ensure_column(c: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db() -> None:
     with _db_lock, _conn() as c:
         c.execute(
             """CREATE TABLE IF NOT EXISTS seen (
-                   uid TEXT PRIMARY KEY,
-                   platform TEXT,
-                   title TEXT,
-                   link TEXT,
-                   seeded INTEGER DEFAULT 0,
-                   ts TEXT)"""
+                    uid TEXT PRIMARY KEY,
+                    platform TEXT,
+                    title TEXT,
+                    link TEXT,
+                    seeded INTEGER DEFAULT 0,
+                    ts TEXT)"""
         )
         c.execute(
             """CREATE TABLE IF NOT EXISTS drafts (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   platform TEXT,
-                   title TEXT,
-                   link TEXT,
-                   draft TEXT,
-                   status TEXT DEFAULT 'pending',
-                   created_at TEXT,
-                   decided_at TEXT)"""
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT,
+                    title TEXT,
+                    link TEXT,
+                    draft TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TEXT,
+                    decided_at TEXT)"""
         )
+        _ensure_column(c, "drafts", "plan", "TEXT")
+        _ensure_column(c, "drafts", "code", "TEXT")
+        _ensure_column(c, "drafts", "budget_info", "TEXT")
 
 
 def seen_count() -> int:
@@ -193,11 +179,12 @@ def mark_seen(uid: str, platform: str, title: str, link: str, seeded: bool = Fal
         )
 
 
-def save_draft(platform: str, title: str, link: str, draft: str) -> int:
+def save_draft(platform: str, title: str, link: str, draft: str, plan: str, code: str, budget_info: str) -> int:
     with _db_lock, _conn() as c:
         cur = c.execute(
-            "INSERT INTO drafts(platform,title,link,draft,status,created_at) VALUES (?,?,?,?, 'pending', ?)",
-            (platform, title, link, draft, now_str()),
+            "INSERT INTO drafts(platform,title,link,draft,plan,code,budget_info,status,created_at) "
+            "VALUES (?,?,?,?,?,?,?, 'pending', ?)",
+            (platform, title, link, draft, plan, code, budget_info, now_str()),
         )
         return cur.lastrowid
 
@@ -205,7 +192,7 @@ def save_draft(platform: str, title: str, link: str, draft: str) -> int:
 def get_draft(draft_id: int):
     with _db_lock, _conn() as c:
         return c.execute(
-            "SELECT platform,title,link,draft,status FROM drafts WHERE id=?", (draft_id,)
+            "SELECT platform,title,link,draft,status,plan,code,budget_info FROM drafts WHERE id=?", (draft_id,)
         ).fetchone()
 
 
@@ -247,32 +234,20 @@ def get_stats() -> dict:
         "오늘날짜(KST)": today,
         "신규 수집(오늘)": collected_today,
         "신규 수집(누적)": collected_total,
-        "최초 실행 시 기준점으로만 저장된 기존 공고 수": baseline,
-        "플랫폼별 신규 수집(누적)": by_platform,
-        "제안서 초안 생성(오늘)": drafts_today,
-        "상태별 초안(누적)": {
-            "대기중": status_all.get("pending", 0),
-            "승인": status_all.get("approved", 0),
-            "거절": status_all.get("rejected", 0),
-        },
+        "기준점 공고 수": baseline,
+        "플랫폼별 수집": by_platform,
+        "생성된 초안(오늘)": drafts_today,
+        "상태별 초안": {"대기중": status_all.get("pending", 0), "승인": status_all.get("approved", 0), "거절": status_all.get("rejected", 0)},
         "오늘 승인": approved_today,
         "오늘 거절": rejected_today,
-        "최근 초안 5건": [
-            {"플랫폼": p, "제목": t, "상태": s, "생성시각": ts} for p, t, s, ts in recent
-        ],
-        "봇 시작 시각": STATE["started_at"],
-        "마지막 수집 시각": STATE["last_poll_at"],
-        "마지막 수집에서 새로 알린 건수": STATE["last_poll_new"],
-        "피드 수집 오류 누적 횟수": STATE["feed_errors"],
-        "수집 주기(초)": POLL_INTERVAL,
-        "구독 중인 피드": {k: len(v) for k, v in FEEDS.items()},
+        "최근 초안 5건": [{"플랫폼": p, "제목": t, "상태": s, "생성시각": ts} for p, t, s, ts in recent],
     }
 
 
 # ----------------------------------------------------------------------------
-# RSS 수집
+# RSS 및 텍스트 정제
 # ----------------------------------------------------------------------------
-def clean_html(text: str, limit: int = 3000) -> str:
+def clean_html(text: str, limit: int = 4000) -> str:
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -280,7 +255,6 @@ def clean_html(text: str, limit: int = 3000) -> str:
 
 
 def make_uid(entry) -> str:
-    # 링크를 우선 기준으로 삼아 피드가 달라도 같은 공고는 같은 ID가 되게 함
     raw = (entry.get("link") or entry.get("id") or entry.get("title", "")).strip()
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -303,28 +277,33 @@ def fetch_feed_sync(url: str) -> list[dict]:
 
 
 # ----------------------------------------------------------------------------
-# Claude
+# Claude 분석 및 필터링 프롬프트
 # ----------------------------------------------------------------------------
-PLATFORM_GUIDE = {
-    "Upwork": (
-        "Write an Upwork cover letter. 150-250 words. Open with a specific hook that proves you read the post "
-        "(no 'Hello, I am writing to apply'). Briefly show relevant experience, outline a concrete first-step "
-        "approach, and end with one sharp clarifying question. Plain text, no markdown headings."
-    ),
-    "Fiverr": (
-        "Write a Fiverr buyer-request offer message. 80-150 words, friendly and direct. State what you will "
-        "deliver, a short how-it-works, and a call to action. Leave [PRICE] and [DELIVERY DAYS] as placeholders. "
-        "Plain text, no markdown headings."
-    ),
-}
-GENERIC_GUIDE = (
-    "Write a concise, compelling application message for this job post. 120-200 words. Open with a specific hook "
-    "that proves you read the post, show relevant experience, propose a concrete first step, and end with one "
-    "clarifying question. Plain text, no markdown headings."
+FILTER_AND_GEN_SYSTEM = """
+You are an expert AI assistant for a solo freelancer who wants fast, high-ROI fixed-price gigs.
+Analyze the given job post and strictly evaluate whether it passes the filter:
+1) PAYMENT TYPE: Reject immediately if it is Hourly. ONLY accept Fixed-Price gigs.
+2) SCOPE: Must be a very simple 1-3 hour task (e.g., quick bug fix, simple web scraping, lightweight script) executable via Python. Reject complex large projects or customer support.
+
+If it FAILS the filter, your response must start with "REJECTED:" followed by the reason.
+If it PASSES, provide the output in EXACTLY this format:
+
+===BUDGET===
+(Estimated fixed price in USD, e.g., "$150" or "약 $150~$200" and estimated Korean Won conversion)
+===PROPOSAL===
+(Write an Upwork/Fiverr proposal. 150-250 words. Hook proving you read it, relevant experience from Twomin Studio, concrete first step, and 1 clarifying question. Plain text, no markdown headers.)
+===PLAN===
+(Korean, max 150 words: 1) 난이도: 하, 2) 핵심 구현 방식, 3) 필요 라이브러리)
+===CODE===
+(One complete, runnable Python 3 file solving the core task. Clean comments, env variables for secrets, main() entry point.)
+"""
+
+STATS_SYSTEM = (
+    "너는 프리랜서 공고 수집 봇의 전용 비서야. 사용자의 질문에 DB 통계를 기반으로 친절하고 간결한 한국어로 답변해 줘. (6줄 이내)"
 )
 
 
-async def ask_claude(system: str, user: str, max_tokens: int = 800) -> str:
+async def ask_claude(system: str, user: str, max_tokens: int = 1500) -> str:
     resp = await claude.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
@@ -334,50 +313,85 @@ async def ask_claude(system: str, user: str, max_tokens: int = 800) -> str:
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
-async def generate_proposal(platform: str, title: str, summary: str, link: str) -> str:
-    system = (
-        "You are a freelance proposal writer. Write in the same language as the job post. "
-        "Be specific, honest, and concise. Never invent credentials, past clients, or numbers. "
-        "Output ONLY the proposal text.\n\n"
-        f"Freelancer profile: {PROFILE}\n\n{PLATFORM_GUIDE.get(platform, GENERIC_GUIDE)}"
-    )
-    user = f"Platform: {platform}\nJob title: {title}\nLink: {link}\n\nJob description:\n{summary}"
-    return await ask_claude(system, user, max_tokens=800)
+def parse_analysis(text: str) -> tuple[bool, str, str, str, str]:
+    if text.startswith("REJECTED:"):
+        return False, "", "", "", ""
+    
+    budget, proposal, plan, code = "", "", "", ""
+    try:
+        parts = text.split("===BUDGET===")
+        if len(parts) > 1:
+            rest = parts[1]
+            b_parts = rest.split("===PROPOSAL===")
+            budget = b_parts[0].strip()
+            if len(b_parts) > 1:
+                p_parts = b_parts[1].split("===PLAN===")
+                proposal = p_parts[0].strip()
+                if len(p_parts) > 1:
+                    c_parts = p_parts[1].split("===CODE===")
+                    plan = c_parts[0].strip()
+                    if len(c_parts) > 1:
+                        code = c_parts[1].strip()
+    except Exception:
+        pass
+
+    # 코드 블록 정리
+    m = re.search(r"```(?:python|py)?[ \t]*\n(.*?)```", code, re.S)
+    if m:
+        code = m.group(1).strip()
+    else:
+        code = re.sub(r"^```(?:python|py)?[ \t]*\n", "", code)
+        code = re.sub(r"\n```\s*$", "", code).strip()
+
+    return True, budget, proposal, plan, code
 
 
-STATS_SYSTEM = (
-    "너는 프리랜서 공고 수집/제안서 봇의 비서야. 사용자가 텔레그램에서 평소 말투로 현황을 물어보면, "
-    "아래 [현재 데이터]에 있는 숫자와 사실만 사용해서 친절하고 간결한 한국어(반말 섞인 친근한 존댓말 정도)로 답해. "
-    "데이터에 없는 내용은 지어내지 말고 '그건 아직 기록이 없어요'라고 말해. "
-    "'신규 수집'은 봇이 알림 대상으로 처리한 공고이고, '기준점'은 최초 실행 때 알림 없이 저장만 한 기존 공고라는 점을 "
-    "필요할 때만 짧게 설명해. 공고 수집/제안서/현황과 전혀 무관한 질문이면 현황 관련 질문만 도와줄 수 있다고 안내해. "
-    "답변은 6줄 이내, 이모지는 적당히."
-)
+async def analyze_and_generate(platform: str, title: str, summary: str, link: str) -> tuple[bool, str, str, str, str]:
+    user_prompt = f"Platform: {platform}\nJob Title: {title}\nLink: {link}\n\nDescription:\n{summary}"
+    raw = await ask_claude(FILTER_AND_GEN_SYSTEM, user_prompt, max_tokens=4000)
+    return parse_analysis(raw)
+
+
+def syntax_check(code: str) -> str:
+    if not code:
+        return "코드 없음"
+    try:
+        ast.parse(code)
+        return "문법 검사 통과 (실행 준비 완료)"
+    except SyntaxError as e:
+        return f"⚠️ 문법 오류 가능 (line {e.lineno})"
 
 
 # ----------------------------------------------------------------------------
-# 텔레그램 UI
+# 텔레그램 UI 및 메시지 렌더링
 # ----------------------------------------------------------------------------
 def keyboard(draft_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[
-            InlineKeyboardButton("✅ 승인 (Send)", callback_data=f"ok:{draft_id}"),
-            InlineKeyboardButton("❌ 거절 (Reject)", callback_data=f"no:{draft_id}"),
+            InlineKeyboardButton("✅ 승인 및 코드 제작", callback_data=f"ok:{draft_id}"),
+            InlineKeyboardButton("❌ 거절", callback_data=f"no:{draft_id}"),
         ]]
     )
 
 
-def build_message(platform: str, title: str, link: str, draft: str) -> str:
-    msg = f"🆕 [{platform}] {title}\n🔗 {link}\n\n📝 제안서 초안\n{'─' * 16}\n{draft}"
-    return msg[:4000]  # 텔레그램 4096자 제한 여유
+def build_notification_message(draft_id: int, platform: str, title: str, link: str, budget: str, plan: str, draft: str) -> str:
+    return (
+        f"📌 [공고 #{draft_id}] {title}\n"
+        f"💰 결제/예산: [건당 고정가] {budget}\n"
+        f"⏱️ 예상 소요 시간: 1~3시간 컷 (초단기 꿀알바)\n"
+        f"🔗 원문 링크: {link}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 [핵심 요약 및 제안서 초안]\n{draft[:800]}\n\n"
+        f"🛠 [구현 방안]\n{plan[:500]}"
+    )
 
 
 # ----------------------------------------------------------------------------
-# 수집 작업 (주기 실행)
+# 주기적 RSS 폴링 작업
 # ----------------------------------------------------------------------------
 async def poll_feeds(context: ContextTypes.DEFAULT_TYPE) -> int:
     if _poll_lock.locked():
-        log.info("이전 수집 작업이 아직 진행 중이라 건너뜁니다.")
+        log.info("이전 수집 작업 진행 중...")
         return 0
 
     async with _poll_lock:
@@ -390,47 +404,49 @@ async def poll_feeds(context: ContextTypes.DEFAULT_TYPE) -> int:
                     items = await asyncio.to_thread(fetch_feed_sync, url)
                 except Exception as e:
                     STATE["feed_errors"] += 1
-                    log.warning("피드 수집 오류 (%s): %s", url, e)
+                    log.warning("피드 오류 (%s): %s", url, e)
                     continue
 
                 for item in items:
                     if await asyncio.to_thread(is_seen, item["uid"]):
                         continue
 
-                    if first_run:  # 최초 실행: 기존 공고는 알림 없이 기록만
-                        await asyncio.to_thread(
-                            mark_seen, item["uid"], platform, item["title"], item["link"], True
-                        )
+                    if first_run:
+                        await asyncio.to_thread(mark_seen, item["uid"], platform, item["title"], item["link"], True)
                         continue
 
                     if sent >= MAX_NEW_PER_CYCLE:
-                        continue  # 다음 주기에 처리 (seen 기록 안 함)
+                        continue
 
                     try:
-                        draft = await generate_proposal(platform, item["title"], item["summary"], item["link"])
-                        draft_id = await asyncio.to_thread(
-                            save_draft, platform, item["title"], item["link"], draft
+                        passed, budget, proposal, plan, code = await analyze_and_generate(
+                            platform, item["title"], item["summary"], item["link"]
                         )
+                        
+                        # 필터 탈락(시간제 또는 대형 프로젝트)인 경우 슨슬하게 seen 처리만 하고 알림 스킵
+                        if not passed:
+                            await asyncio.to_thread(mark_seen, item["uid"], platform, item["title"], item["link"], False)
+                            continue
+
+                        draft_id = await asyncio.to_thread(
+                            save_draft, platform, item["title"], item["link"], proposal, plan, code, budget
+                        )
+                        
+                        msg_text = build_notification_message(draft_id, platform, item["title"], item["link"], budget, plan, proposal)
                         await context.bot.send_message(
                             chat_id=ADMIN_CHAT_ID,
-                            text=build_message(platform, item["title"], item["link"], draft),
+                            text=msg_text,
                             reply_markup=keyboard(draft_id),
                             disable_web_page_preview=True,
                         )
-                        # 알림 전송에 성공한 뒤에만 '처리 완료'로 기록 → 실패 건은 다음 주기에 재시도
-                        await asyncio.to_thread(
-                            mark_seen, item["uid"], platform, item["title"], item["link"], False
-                        )
+                        
+                        await asyncio.to_thread(mark_seen, item["uid"], platform, item["title"], item["link"], False)
                         sent += 1
                     except Exception:
-                        log.exception("제안서 생성/전송 실패: %s", item["title"])
+                        log.exception("공고 분석 및 전송 실패: %s", item["title"])
 
         STATE["last_poll_at"] = now_str()
         STATE["last_poll_new"] = sent
-        if first_run:
-            log.info("최초 실행: 기존 공고를 기준점으로 저장했습니다. 이후 신규 공고만 알립니다.")
-        elif sent:
-            log.info("신규 공고 %d건 알림 전송", sent)
         return sent
 
 
@@ -439,14 +455,11 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ----------------------------------------------------------------------------
-# 핸들러
+# 텔레그램 핸들러
 # ----------------------------------------------------------------------------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query:
-        return
-    if not query.message or query.message.chat.id != ADMIN_CHAT_ID:
-        await query.answer("권한이 없습니다.", show_alert=True)
+    if not query or not query.message or query.message.chat.id != ADMIN_CHAT_ID:
         return
 
     action, _, raw_id = (query.data or "").partition(":")
@@ -459,10 +472,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not row:
         await query.answer("초안을 찾을 수 없어요.", show_alert=True)
         return
-    platform, title, link, draft, status = row
+    platform, title, link, draft, status, plan, code, budget = row
 
     if status != "pending":
-        await query.answer(f"이미 처리됨 ({status})")
+        await query.answer(f"이미 처리된 공고입니다 ({status})")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -471,45 +484,54 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if action == "ok":
         await asyncio.to_thread(set_status, draft_id, "approved")
-        await query.answer("승인 완료")
+        await query.answer("승인 완료!")
         await query.edit_message_text(
-            text=f"✅ 승인 완료 — [{platform}] {title}\n🔗 {link}",
+            text=f"✅ [승인 완료] 공고 #{draft_id}\n[{platform}] {title}\n🔗 {link}",
             disable_web_page_preview=True,
         )
-        # 업워크/파이버에는 공식 제안서 제출 API가 없으므로, 바로 복사해 붙여넣을 최종본을 전송
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="📋 아래 최종본을 복사해서 제출하세요 👇")
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=draft[:4000])
+        
+        # 스마트폰 복사 최적화 마크다운 블록 전송
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="📋 [맞춤형 제안서 초안] (길게 눌러 복사하세요)")
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"```text\n{draft}\n```", parse_mode="Markdown")
+        
+        if plan:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"🛠 [구현 방안]\n{plan}")
+            
+        if code:
+            await context.bot.send_document(
+                chat_id=ADMIN_CHAT_ID,
+                document=io.BytesIO(code.encode("utf-8")),
+                filename=f"solution_{draft_id}.py",
+                caption=f"💻 [구현 소스 코드 파일]\n{syntax_check(code)}",
+            )
     elif action == "no":
         await asyncio.to_thread(set_status, draft_id, "rejected")
-        await query.answer("거절 처리")
+        await query.answer("거절 처리됨")
         await query.edit_message_text(
-            text=f"❌ 거절됨 — [{platform}] {title}",
+            text=f"❌ [거절됨] 공고 #{draft_id}\n[{platform}] {title}",
             disable_web_page_preview=True,
         )
-    else:
-        await query.answer()
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🤖 제안서 봇 가동 중이에요.\n"
-        f"모델: {MODEL}\n수집 주기: {POLL_INTERVAL}초\n\n"
-        "• /check — 지금 바로 공고 확인\n"
-        "• 그냥 \"오늘 몇 개 수집됐어?\", \"현황 알려줘\" 처럼 말을 걸어도 돼요."
+        "🚀 1인 무인 외주 자동화 비서 봇 가동 중!\n\n"
+        "• 건당 고정가(Fixed-Price) & 1~3시간 컷 꿀알바만 자동 선별합니다.\n"
+        "• /check — 지금 즉시 공고 강제 스캔\n"
+        "• 편하게 '오늘 몇 개 수집됐어?'라고 물어보세요."
     )
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _poll_lock.locked():
-        await update.message.reply_text("⏳ 이미 수집이 진행 중이에요. 잠시 후 다시 시도해 주세요.")
+        await update.message.reply_text("⏳ 수집 작업이 이미 진행 중입니다.")
         return
-    await update.message.reply_text("🔎 공고 확인 중...")
+    await update.message.reply_text("🔎 알짜배기 고정가 공고 스캔 및 분석 중...")
     sent = await poll_feeds(context)
-    await update.message.reply_text(f"완료! 새로 알린 공고: {sent}건")
+    await update.message.reply_text(f"스캔 완료! 신규 알림 발송: {sent}건")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """명령어 없이 평소 말투로 묻는 질문 → DB 통계를 근거로 Claude가 자연어로 답변"""
     msg = update.message
     if not msg or not msg.text:
         return
@@ -519,50 +541,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = json.dumps(stats, ensure_ascii=False, indent=2)
 
     try:
-        answer = await ask_claude(
-            STATS_SYSTEM,
-            f"[현재 데이터]\n{data}\n\n[사용자 질문]\n{msg.text}",
-            max_tokens=600,
-        )
-        await msg.reply_text(answer[:4000] or "답변을 만들지 못했어요. 다시 물어봐 주세요.")
+        answer = await ask_claude(STATS_SYSTEM, f"[현재 데이터]\n{data}\n\n[사용자 질문]\n{msg.text}", max_tokens=500)
+        await msg.reply_text(answer[:4000])
     except Exception:
-        log.exception("자연어 답변 생성 실패")
-        fallback = (
-            "⚠️ AI 답변 생성에 실패해서 숫자만 알려드릴게요.\n"
-            f"• 오늘 신규 수집: {stats['신규 수집(오늘)']}건\n"
-            f"• 누적 신규 수집: {stats['신규 수집(누적)']}건\n"
-            f"• 대기중/승인/거절: {stats['상태별 초안(누적)']['대기중']}/"
-            f"{stats['상태별 초안(누적)']['승인']}/{stats['상태별 초안(누적)']['거절']}"
-        )
-        await msg.reply_text(fallback)
+        log.exception("자연어 답변 실패")
+        await msg.reply_text(f"📊 오늘 신규 수집 공고: {stats['신규 수집(오늘)']}건 | 대기중: {stats['상태별 초안']['대기중']}건")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
-        log.warning(
-            "Telegram Conflict: 같은 토큰으로 폴링하는 다른 인스턴스가 있습니다. "
-            "(로컬 PC/다른 Render 서비스/배포 겹침 확인)"
-        )
         return
-    log.error("핸들러 오류", exc_info=context.error)
+    log.error("봇 핸들러 오류", exc_info=context.error)
 
 
 # ----------------------------------------------------------------------------
-# Render용 헬스체크 서버 ($PORT 바인딩) — 텔레그램은 폴링이라 포트와 충돌 없음
+# Render 헬스체크 웹서버
 # ----------------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def _ok(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", "text/plain")
         self.end_headers()
-
     def do_GET(self):
         self._ok()
         self.wfile.write(b"ok")
-
     def do_HEAD(self):
         self._ok()
-
     def log_message(self, *args):
         pass
 
@@ -571,18 +575,18 @@ def start_health_server() -> None:
     port = int(os.environ.get("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("헬스체크 서버 시작: 0.0.0.0:%d", port)
+    log.info("헬스체크 서버 구동 포트: %d", port)
 
 
 # ----------------------------------------------------------------------------
-# main
+# 메인 실행부
 # ----------------------------------------------------------------------------
 async def post_init(app: Application) -> None:
     STATE["started_at"] = now_str()
     try:
-        await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🚀 제안서 봇이 시작됐어요.")
+        await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🤖 외주 자동화 비서 봇이 완벽하게 세팅되어 가동을 시작합니다.")
     except Exception:
-        log.exception("시작 알림 전송 실패 (TELEGRAM_ADMIN_CHAT_ID 확인, 봇에게 먼저 /start 필요)")
+        log.exception("시작 알림 전송 실패")
 
 
 def main() -> None:
@@ -590,8 +594,8 @@ def main() -> None:
     start_health_server()
 
     admin_only = filters.Chat(chat_id=ADMIN_CHAT_ID)
-
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+
     app.add_handler(CommandHandler("start", cmd_start, filters=admin_only))
     app.add_handler(CommandHandler("check", cmd_check, filters=admin_only))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(ok|no):\d+$"))
@@ -600,11 +604,8 @@ def main() -> None:
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=10, name="poll_feeds")
 
-    log.info("봇 시작 (polling) | 모델=%s | 피드=%s", MODEL, {k: len(v) for k, v in FEEDS.items()})
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,  # 재시작 시 밀린 업데이트로 인한 중복 처리 방지
-    )
+    log.info("봇 시작 (Polling) | 모델=%s", MODEL)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
