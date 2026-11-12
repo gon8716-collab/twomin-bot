@@ -1,180 +1,150 @@
 import os
 import logging
-import asyncio
 import feedparser
+import httpx
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-    CallbackQueryHandler,
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # 로깅 설정
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 환경 변수 불러오기
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
 
-# Claude 클라이언트 초기화
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+# 클라이언트 초기화
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# 이미 처리한 공고 ID를 기억하여 중복 알림 방지
-processed_job_ids = set()
+# 업워크 RSS 피드 URL (예: Python 관련 최신 공고 검색 RSS)
+UPWORK_RSS_URL = "https://www.upwork.com/ab/feed/jobs/rss?q=python&sort=rec"
 
-# -------------------------------------------------------------------------
-# 1. Claude API를 통한 제안서(Proposal) 초안 자동 생성 함수
-# -------------------------------------------------------------------------
-def generate_proposal_with_claude(job_title, job_description):
-    if not claude_client:
-        return "⚠️ Anthropic API Key가 설정되지 않아 제안서를 생성할 수 없습니다."
-    
-    prompt = f"""
-당신은 뛰어난 프리랜서 제안서 작성 전문가입니다. 아래 업워크 공고를 분석하고, 클라이언트의 마음을 사로잡을 수 있는 전문적이고 간결한 영문 제안서 초안을 작성해주세요.
+# 이미 처리한 공고 ID 저장용 세트 (중복 알림 방지)
+processed_jobs = set()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """봇 시작 명령어"""
+    await update.message.reply_text("🤖 업워크 자동 제안서 봇이 정상적으로 작동 중입니다!")
+
+def fetch_latest_upwork_job():
+    """업워크 RSS에서 최신 공고 1개를 가져옴"""
+    try:
+        feed = feedparser.parse(UPWORK_RSS_URL)
+        if not feed.entries:
+            return None
+        
+        latest_entry = feed.entries[0]
+        job_id = latest_entry.id
+        job_title = latest_entry.title
+        job_summary = latest_entry.summary
+        job_link = latest_entry.link
+        
+        return {
+            "id": job_id,
+            "title": job_title,
+            "summary": job_summary,
+            "link": job_link
+        }
+    except Exception as e:
+        logger.error(f"RSS 피드 수집 에러: {e}")
+        return None
+
+def generate_proposal_with_claude(job_title, job_summary):
+    """클로드 API를 이용해 맞춤형 제안서 초안 작성"""
+    try:
+        prompt = f"""
+다음은 업워크에 올라온 프리랜서 구인 공고입니다. 이 공고를 분석하고, 클라이언트의 마음을 사로잡을 수 있는 전문적이고 설득력 있는 영문 제안서(Proposal) 초안을 작성해주세요.
 
 [공고 제목]
 {job_title}
 
 [공고 내용]
-{job_description}
+{job_summary}
 
-[작성 지침]
-1. 친근하면서도 신뢰감을 주는 전문적인 어조를 사용할 것.
-2. 클라이언트의 요구사항을 정확히 이해했음을 첫 줄에서 어필할 것.
-3. 관련 경험과 실행 방안을 간결하게 제시할 것.
+제안서 초안:
 """
-    try:
-        response = claude_client.messages.create(
+        response = anthropic_client.messages.create(
             model="claude-3-5-sonnet-20241022",
-            max_tokens=600,
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
         return response.content[0].text
     except Exception as e:
-        logger.error(f"Claude API 호출 에러: {e}")
-        return f"제안서 생성 중 오류가 발생했습니다: {str(e)}"
+        logger.error(f"Claude API 생성 에러: {e}")
+        return "제안서 생성 중 오류가 발생했습니다."
 
-# -------------------------------------------------------------------------
-# 2. 업워크 공고 크롤링 (RSS 피드 활용 방식)
-# -------------------------------------------------------------------------
-async def fetch_latest_upwork_job():
-    rss_url = "https://www.upwork.com/ab/feed/jobs/rss?q=python&sort=recency"
+async def check_jobs(context: ContextTypes.DEFAULT_TYPE):
+    """주기적으로 업워크 공고를 확인하고 텔레그램으로 전송"""
+    job = fetch_latest_upwork_job()
+    if not job:
+        return
     
-    try:
-        feed = await asyncio.to_thread(feedparser.parse, rss_url)
-        if feed.entries:
-            latest_entry = feed.entries[0]
-            job_id = latest_entry.id
-            job_title = latest_entry.title
-            job_desc = latest_entry.summary
-            job_link = latest_entry.link
-            return job_id, job_title, job_desc, job_link
-    except Exception as e:
-        logger.error(f"업워크 크롤링 에러: {e}")
+    job_id = job["id"]
+    if job_id in processed_jobs:
+        return  # 이미 처리한 공고면 패스
     
-    return None, None, None, None
-
-# -------------------------------------------------------------------------
-# 3. 백그라운드 공고 모니터링 루프
-# -------------------------------------------------------------------------
-async def job_monitor_loop(application):
-    await asyncio.sleep(10)
+    # 새로운 공고 처리 등록
+    processed_jobs.add(job_id)
     
-    while True:
-        try:
-            job_id, title, desc, link = await fetch_latest_upwork_job()
-            
-            if job_id and job_id not in processed_job_ids:
-                processed_job_ids.add(job_id)
-                
-                if len(processed_job_ids) > 100:
-                    processed_job_ids.pop()
-                
-                logger.info(f"신규 공고 발견: {title}")
-                
-                # Claude로 제안서 초안 생성
-                proposal_draft = generate_proposal_with_claude(title, desc)
-                
-                message_text = (
-                    f"🚨 **[신규 업워크 공고 감지]**\n\n"
-                    f"📌 **제목:** {title}\n"
-                    f"🔗 **링크:** {link}\n\n"
-                    f"📝 **[Claude 제안서 초안]**\n{proposal_draft}"
-                )
-                
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ 승인 및 전송", callback_data=f"approve_{job_id}"),
-                        InlineKeyboardButton("❌ 거절", callback_data=f"reject_{job_id}")
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
-                
-                if ADMIN_CHAT_ID:
-                    await application.bot.send_message(
-                        chat_id=ADMIN_CHAT_ID,
-                        text=message_text,
-                        reply_markup=reply_markup,
-                        parse_mode="Markdown"
-                    )
-        
-        except Exception as e:
-            logger.error(f"모니터링 루프 에러: {e}")
-        
-        await asyncio.sleep(300)
-
-# -------------------------------------------------------------------------
-# 4. 텔레그램 명령어 및 버튼 핸들러
-# -------------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
-    chat_id = update.effective_chat.id
+    # 클로드로 제안서 생성
+    proposal = generate_proposal_with_claude(job["title"], job["summary"])
     
-    logger.info(f"사용자 Chat ID: {chat_id}")
-    
-    await update.message.reply_text(
-        f"안녕하세요, {user_name}님! 🚀\n\n"
-        f"현재 사장님의 텔레그램 Chat ID는 바로 이 번호입니다:\n"
-        f"👉 `{chat_id}` 👈\n\n"
-        "이 번호가 Render 환경 변수(`TELEGRAM_ADMIN_CHAT_ID`)에 정상 등록되었습니다!"
+    # 텔레그램 메시지 구성
+    message_text = (
+        f"🚨 **새로운 업워크 공고 발견!**\n\n"
+        f"📌 **제목:** {job['title']}\n"
+        f"🔗 **링크:** {job['link']}\n\n"
+        f"📝 **[클로드 작성 제안서 초안]**\n{proposal}"
     )
+    
+    # 승인 / 거절 버튼 생성
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ 승인 및 전송", callback_data="approve_job"),
+            InlineKeyboardButton("❌ 거절", callback_data="reject_job")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # 관리자에게 전송
+    if ADMIN_CHAT_ID:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=message_text,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """텔레그램 버튼 클릭 이벤트 처리"""
     query = update.callback_query
     await query.answer()
     
-    data = query.data
-    if data.startswith("approve_"):
-        await query.edit_message_text(text=f"{query.message.text}\n\n✅ **[상태: 승인 완료 및 전송됨]**")
-    elif data.startswith("reject_"):
-        await query.edit_message_text(text=f"{query.message.text}\n\n❌ **[상태: 거절됨 (무시함)]**")
+    if query.data == "approve_job":
+        await query.edit_message_text(text=query.message.text + "\n\n✅ **[상태: 승인됨 (전송 완료)]**")
+    elif query.data == "reject_job":
+        await query.edit_message_text(text=query.message.text + "\n\n❌ **[상태: 거절됨]**")
 
 def main():
+    """봇 실행 메인 함수"""
     if not TELEGRAM_BOT_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN 환경 변수가 설정되지 않았습니다.")
+        logger.error("TELEGRAM_BOT_TOKEN이 설정되지 않았습니다.")
         return
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # 핸들러 등록
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    async def post_init(app):
-        asyncio.create_task(job_monitor_loop(app))
-        
-    application.post_init = post_init
+    # 백그라운드 작업 스케줄러 (10분마다 업워크 RSS 확인)
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_jobs, interval=600, first=10)
 
-    print("봇을 실행합니다...")
-    # 충돌 방지 옵션(drop_pending_updates=True) 추가 완료!
-    application.run_polling(drop_pending_updates=True)
+    # 봇 실행 (폴링 방식)
+    application.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
